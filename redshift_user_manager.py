@@ -9,6 +9,7 @@ Features
 - Create users (auto-generates a strong password when left empty).
 - Reset passwords for existing users.
 - Grant/revoke read-only or read/write privileges per database/schema.
+- Grant/revoke CREATE on databases (lets a user create schemas/objects).
 - Delete users.
 
 The interface and code are intentionally kept in English to match the request.
@@ -78,6 +79,19 @@ class SchemaPrivilege:
     def ensure_write_implies_read(self) -> None:
         if self.write and not self.read:
             self.read = True
+
+
+@dataclass
+class DatabaseCreatePrivilege:
+    """Tracks whether a user holds CREATE on a database (i.e. can create schemas)."""
+
+    database: str
+    create: bool = False
+    original: bool = False
+
+    def label(self) -> str:
+        flag = f"[C:{'x' if self.create else ' '}]"
+        return f"{flag} {self.database}"
 
 
 def ensure_dependencies() -> None:
@@ -371,6 +385,54 @@ def apply_privileges(settings: Settings, username: str, selections: List[SchemaP
                 grant_privileges(conn, username, item)
 
 
+def fetch_database_create_privileges(conn, username: str) -> List[DatabaseCreatePrivilege]:
+    """Return the CREATE-on-database state for the user across all visible databases."""
+    items: List[DatabaseCreatePrivilege] = []
+    for db_name in list_databases(conn):
+        try:
+            with cursor(conn) as cur:
+                cur.execute("SELECT has_database_privilege(%s, %s, 'CREATE')", [username, db_name])
+                has_create = bool(cur.fetchone()[0])
+        except Exception:
+            # Skip databases we cannot introspect (e.g. shared/catalog databases).
+            conn.rollback()
+            continue
+        items.append(DatabaseCreatePrivilege(database=db_name, create=has_create, original=has_create))
+    return items
+
+
+def grant_database_create(conn, username: str, database: str) -> None:
+    with cursor(conn) as cur:
+        cur.execute(
+            sql.SQL("GRANT CREATE ON DATABASE {} TO {}").format(
+                sql.Identifier(database), sql.Identifier(username)
+            )
+        )
+
+
+def revoke_database_create(conn, username: str, database: str) -> None:
+    with cursor(conn) as cur:
+        cur.execute(
+            sql.SQL("REVOKE CREATE ON DATABASE {} FROM {}").format(
+                sql.Identifier(database), sql.Identifier(username)
+            )
+        )
+
+
+def apply_database_create_privileges(conn, username: str, items: List[DatabaseCreatePrivilege]) -> int:
+    """Apply only the toggled CREATE privileges. Returns the number of changes made."""
+    changed = 0
+    for item in items:
+        if item.create == item.original:
+            continue
+        if item.create:
+            grant_database_create(conn, username, item.database)
+        else:
+            revoke_database_create(conn, username, item.database)
+        changed += 1
+    return changed
+
+
 def purge_user_privileges(settings: Settings, username: str) -> None:
     """Best-effort revoke privileges and default privileges across accessible databases."""
     try:
@@ -389,6 +451,10 @@ def purge_user_privileges(settings: Settings, username: str) -> None:
                 for schema in schemas:
                     revoke_privileges(conn, username, schema)
                     revoke_default_privileges(conn, username, schema, owners)
+                try:
+                    revoke_database_create(conn, username, db_name)
+                except Exception:
+                    conn.rollback()
         except Exception:
             continue
 
@@ -599,6 +665,39 @@ def checkbox_menu(stdscr, title: str, items: List[SchemaPrivilege], settings: Se
             return items
 
 
+def database_create_menu(
+    stdscr, title: str, items: List[DatabaseCreatePrivilege], settings: Settings
+) -> Optional[List[DatabaseCreatePrivilege]]:
+    index = 0
+    while True:
+        stdscr.clear()
+        content_start = render_header(stdscr, settings, subtitle=title)
+        height, width = stdscr.getmaxyx()
+        render_footer(
+            stdscr, "Arrows move • C/Space toggles CREATE • Enter confirm • Esc/q to cancel"
+        )
+        footer_line = height - 1
+        visible_height = max(1, footer_line - content_start)
+        start = max(0, min(index - visible_height // 2, len(items) - visible_height))
+        for i, item in enumerate(items[start : start + visible_height]):
+            line_index = start + i
+            prefix = "➤ " if line_index == index else "  "
+            attr = COLOR_HIGHLIGHT if line_index == index else COLOR_NORMAL
+            stdscr.addstr(content_start + i, 0, (prefix + item.label())[: width - 1], attr)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (ord("q"), ord("Q"), 27):
+            return None
+        if key in (curses.KEY_DOWN, ord("j")):
+            index = (index + 1) % len(items)
+        elif key in (curses.KEY_UP, ord("k")):
+            index = (index - 1) % len(items)
+        elif key in (ord("c"), ord("C"), ord(" ")):
+            items[index].create = not items[index].create
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return items
+
+
 def confirm(stdscr, question: str, settings: Settings) -> bool:
     choice = menu(stdscr, question, ["No", "Yes"], settings=settings)
     return choice == 1
@@ -711,6 +810,37 @@ def flow_modify_privileges(stdscr, settings: Settings, username: str) -> None:
         alert(stdscr, f"Error updating privileges: {exc}")
 
 
+def flow_database_create(stdscr, settings: Settings, username: str) -> None:
+    try:
+        with db_connection(settings) as conn:
+            items = fetch_database_create_privileges(conn, username)
+    except Exception as exc:
+        alert(stdscr, f"Error loading databases: {exc}")
+        return
+    if not items:
+        alert(stdscr, "No databases found or accessible.")
+        return
+    updated = database_create_menu(stdscr, f"CREATE on databases for {username}", items, settings)
+    if updated is None:
+        return
+    pending = [item for item in updated if item.create != item.original]
+    if not pending:
+        alert(stdscr, "No changes to apply.")
+        return
+    plan = "\n".join(
+        f"  {'GRANT ' if item.create else 'REVOKE'} CREATE on {item.database}" for item in pending
+    )
+    alert(stdscr, "Pending changes:\n" + plan)
+    if not confirm(stdscr, f"Apply {len(pending)} CREATE change(s) for {username}?", settings):
+        return
+    try:
+        with db_connection(settings) as conn:
+            changed = apply_database_create_privileges(conn, username, updated)
+        alert(stdscr, f"Updated CREATE privileges for {username} ({changed} change(s)).")
+    except Exception as exc:
+        alert(stdscr, f"Error updating CREATE privileges: {exc}")
+
+
 def flow_delete_user(stdscr, settings: Settings, username: str) -> None:
     if not confirm(stdscr, f"Delete user {username}?", settings):
         return
@@ -727,15 +857,17 @@ def flow_existing_user(stdscr, settings: Settings, username: str) -> None:
     choice = menu(
         stdscr,
         f"User: {username}",
-        ["Back", "Modify privileges", "Reset password", "Delete user"],
+        ["Back", "Modify privileges", "Manage CREATE on databases", "Reset password", "Delete user"],
         selected=1,
         settings=settings,
     )
     if choice == 1:
         flow_modify_privileges(stdscr, settings, username)
     elif choice == 2:
-        flow_reset_password(stdscr, settings, username)
+        flow_database_create(stdscr, settings, username)
     elif choice == 3:
+        flow_reset_password(stdscr, settings, username)
+    elif choice == 4:
         flow_delete_user(stdscr, settings, username)
 
 
